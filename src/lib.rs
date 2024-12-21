@@ -45,7 +45,9 @@ mod tests {
 
     fn read_file_i16(path: &str) -> Vec<i16> {
         let mut f = File::open(path).expect("no file found");
+        #[allow(deprecated)]
         let (_, b) = wav::read(&mut f).unwrap();
+        #[allow(deprecated)]
         b.try_into_sixteen().unwrap()
     }
 

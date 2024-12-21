@@ -13,7 +13,7 @@ use std::cell::RefCell;
 
 #[cfg(test)]
 thread_local! {
-    static LAST_FINAL_RANGE: RefCell<u32> = RefCell::new(0);
+    static LAST_FINAL_RANGE: RefCell<u32> = const { RefCell::new(0) };
 }
 
 #[cfg(test)]
@@ -47,23 +47,26 @@ available while testing, otherwise it is a 0*/
 pub fn decode<T: Read + Seek, const TARGET_SPS: u32>(
     data: T,
 ) -> Result<(Vec<i16>, PlayData), Error> {
-    // Data
+    let opus_sr = const {
+        match s_ps_to_audiopus(TARGET_SPS) {
+            Some(v) => v,
+            None => panic!("Wrong SampleRate"),
+        }
+    };
 
+    // Data
     let mut reader = PacketReader::new(data);
 
     let fp = reader
         .read_packet_expected()
         .map_err(|_| Error::MalformedAudio)?;
-
     let (play_data, dec_data) = check_fp::<TARGET_SPS>(&fp)?;
 
     let chans = match play_data.channels {
-        1 => Ok(audiopus::Channels::Mono),
-        2 => Ok(audiopus::Channels::Stereo),
-        _ => Err(Error::MalformedAudio),
-    }?;
-
-    let opus_sr = s_ps_to_audiopus(TARGET_SPS)?;
+        1 => audiopus::Channels::Mono,
+        2 => audiopus::Channels::Stereo,
+        _ => return Err(Error::MalformedAudio),
+    };
 
     // According to RFC7845 if a device supports 48Khz, decode at this rate
     let mut decoder = OpusDec::new(opus_sr, chans)?;
@@ -76,28 +79,33 @@ pub fn decode<T: Read + Seek, const TARGET_SPS: u32>(
 
     check_sp(&sp)?;
 
-    let mut buffer: Vec<i16> = Vec::new();
+    let mut buffer = Vec::new();
     let mut rem_skip = dec_data.pre_skip as usize;
     let mut dec_absgsp = 0;
+    // We don't need to reallocate temp_buffer because:
+    // 1) We dont borrow
+    // 2) Decoder fully rewrites temp_buffer
+    let mut temp_buffer = [0; MAX_FRAME_SIZE];
 
     while let Some(packet) = reader.read_packet()? {
-        let mut temp_buffer = [0i16; MAX_FRAME_SIZE];
         let inner_packet = audiopus::packet::Packet::try_from(&packet.data)?;
         let again_buffer = audiopus::MutSignals::try_from(&mut temp_buffer[..])?;
 
         let out_size = decoder.decode(Some(inner_packet), again_buffer, false)?;
-        let absgsp = calc_sr_u64(packet.absgp_page(), OGG_OPUS_SPS, TARGET_SPS) as usize;
 
         dec_absgsp += out_size;
 
-        let trimmed_end = if packet.last_in_stream() && dec_absgsp > absgsp {
-            (out_size * play_data.channels as usize) - (dec_absgsp - absgsp)
-        } else {
-            // out_size == num of samples *per channel*
-            out_size * play_data.channels as usize
-        };
-
+        // out_size == num of samples *per channel*
         if rem_skip < out_size {
+            let mut trimmed_end = out_size * play_data.channels as usize;
+            if packet.last_in_stream() {
+                let absgsp = calc_sr_u64(packet.absgp_page(), OGG_OPUS_SPS, TARGET_SPS) as usize;
+
+                if dec_absgsp > absgsp {
+                    trimmed_end -= dec_absgsp - absgsp;
+                }
+            }
+
             buffer.extend_from_slice(&temp_buffer[rem_skip..trimmed_end]);
             rem_skip = 0;
         } else {

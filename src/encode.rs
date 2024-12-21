@@ -20,7 +20,7 @@ use std::cell::RefCell;
 
 #[cfg(test)]
 thread_local! {
-    static LAST_FINAL_RANGE: RefCell<u32> = RefCell::new(0);
+    static LAST_FINAL_RANGE: RefCell<u32> = const { RefCell::new(0) };
 }
 
 #[cfg(test)]
@@ -49,23 +49,15 @@ const fn calc_fr_size(us: u32, channels: u8, sps: u32) -> usize {
     ((samps_ms * channels as u32) / (1000 * US_TO_MS)) as usize
 }
 
+// Determine opus channels at compile-time if possible
 const fn opus_channels(val: u8) -> audiopus::Channels {
     if val == 1 || val == 0 {
         audiopus::Channels::Mono
-    } else {
+    } else if val == 2 {
         audiopus::Channels::Stereo
+    } else {
+        panic!("Invalid number of channels. Use 1 or 2 instead.")
     }
-}
-
-// Calc the biggest frame buffer that still is either smaller or the
-// same size as the input
-fn calc_biggest_spills<T: PartialOrd + Copy>(val: T, possibles: &[T]) -> Option<T> {
-    for container in possibles.iter().rev() {
-        if *container <= val {
-            return Some(*container);
-        }
-    }
-    None
 }
 
 const fn is_end_of_stream(pos: usize, max: usize) -> ogg::PacketWriteEndInfo {
@@ -76,13 +68,18 @@ const fn is_end_of_stream(pos: usize, max: usize) -> ogg::PacketWriteEndInfo {
     }
 }
 
+// Compile-time granule position calculation
 const fn granule<const S_PS: u32>(val: usize) -> u64 {
     calc_sr_u64(val as u64, S_PS, OGG_OPUS_SPS)
 }
 
 pub fn encode<const S_PS: u32, const NUM_CHANNELS: u8>(audio: &[i16]) -> Result<Vec<u8>, Error> {
-    //NOTE: In the future the S_PS const generic will let us use const on a lot
-    // of things, until then we need to use variables
+    let opus_sr = const {
+        match s_ps_to_audiopus(S_PS) {
+            Some(v) => v,
+            None => panic!("Wrong SampleRate"),
+        }
+    };
 
     // This should have a bitrate of 24 Kb/s, exactly what IBM recommends
 
@@ -90,20 +87,16 @@ pub fn encode<const S_PS: u32, const NUM_CHANNELS: u8>(audio: &[i16]) -> Result<
     // a frame time of 20ms is considered good enough for most applications
 
     // Data
-    let frame_samples: usize = to_samples::<S_PS>(FRAME_TIME_MS);
-    let frame_size: usize = frame_samples * (NUM_CHANNELS as usize);
-
+    let frame_samples = const { to_samples::<S_PS>(FRAME_TIME_MS) };
+    let frame_size = const { to_samples::<S_PS>(FRAME_TIME_MS) * (NUM_CHANNELS as usize) };
     // Generate the serial which is nothing but a value to identify a stream, we
     // will also use the process id so that two programs don't use
     // the same serial even if getting one at the same time
-    let mut rnd = rand::thread_rng();
-    let serial = rnd.gen::<u32>() ^ process::id();
-
-    let opus_sr = s_ps_to_audiopus(S_PS)?;
+    let serial = rand::thread_rng().gen::<u32>() ^ process::id();
 
     let mut opus_encoder = OpusEnc::new(
         opus_sr,
-        opus_channels(NUM_CHANNELS),
+        const { opus_channels(NUM_CHANNELS) },
         audiopus::Application::Audio,
     )?;
     // Balance with quality, speed and size, especially for Telegram
@@ -119,12 +112,10 @@ pub fn encode<const S_PS: u32, const NUM_CHANNELS: u8>(audio: &[i16]) -> Result<
 
     let max = (tot_samples as f32 / frame_size as f32).floor() as usize;
 
-    let calc = |counter| -> usize { counter * frame_size };
-    let calc_samples = |counter| -> usize { counter * frame_samples };
-    let mut buffer: Vec<u8> = Vec::with_capacity(calc(max));
+    let mut buffer = Vec::with_capacity(frame_size * max);
     let mut packet_writer = PacketWriter::new(&mut buffer);
 
-    let opus_head: [u8; 19] = [
+    let mut opus_head: [u8; 19] = [
         OPUS_MAGIC_HEADER[0],
         OPUS_MAGIC_HEADER[1],
         OPUS_MAGIC_HEADER[2],
@@ -148,27 +139,15 @@ pub fn encode<const S_PS: u32, const NUM_CHANNELS: u8>(audio: &[i16]) -> Result<
            // If Channel map != 0, here should go channel mapping table
     ];
 
-    let mut head = opus_head;
-    LittleEndian::write_u16(&mut head[10..12], skip_48 as u16); // Write pre-skip
-    LittleEndian::write_u32(&mut head[12..16], S_PS); // Write Samples per second
+    LittleEndian::write_u16(&mut opus_head[10..12], skip_48);
+    LittleEndian::write_u32(&mut opus_head[12..16], S_PS);
 
-    let mut opus_tags: Vec<u8> = Vec::with_capacity(60);
-    opus_tags.extend(b"OpusTags");
-    let mut len_bf = [0u8; 4];
-    LittleEndian::write_u32(&mut len_bf, VENDOR_STR.len() as u32);
-    opus_tags.extend(&len_bf);
-    opus_tags.extend(VENDOR_STR.bytes());
-    opus_tags.extend(&[0u8; 4]); // No user comments
+    packet_writer.write_packet(&opus_head[..], serial, ogg::PacketWriteEndInfo::EndPage, 0)?;
+    packet_writer.write_packet(&OPUS_TAGS, serial, ogg::PacketWriteEndInfo::EndPage, 0)?;
 
-    packet_writer.write_packet(&head[..], serial, ogg::PacketWriteEndInfo::EndPage, 0)?;
-    packet_writer.write_packet(opus_tags, serial, ogg::PacketWriteEndInfo::EndPage, 0)?;
-
-    // Do all frames
     for counter in 0..max {
-        // Last value of counter is max - 1
-        let pos_a = calc(counter);
-        let pos_b = calc(counter + 1);
-        assert!((pos_b - pos_a) <= frame_size);
+        let pos_a = counter * frame_size;
+        let pos_b = (counter + 1) * frame_size;
 
         let new_buffer = inner_encoder.encode_with_skip(audio, pos_a, pos_b, skip_us)?;
 
@@ -176,64 +155,60 @@ pub fn encode<const S_PS: u32, const NUM_CHANNELS: u8>(audio: &[i16]) -> Result<
             new_buffer,
             serial,
             is_end_of_stream(pos_b, tot_samples),
-            granule::<S_PS>(skip_us + calc_samples(counter + 1)),
+            granule::<S_PS>(skip_us + (counter + 1) * frame_samples),
         )?;
     }
 
-    // Try to add as less of empty audio as possible, first everything into
-    // small frames, and on the last one, if needed fill with 0, since the
-    // last one is going to be smaller this should be much less of a problem
-    let mut last_sample = calc(max);
-    assert!(last_sample <= audio.len() + skip_us);
-    let frame_sizes: [usize; 4] = [
-        calc_fr_size(MIN_FRAME_MICROS, NUM_CHANNELS, S_PS),
-        calc_fr_size(50, NUM_CHANNELS, S_PS),
-        calc_fr_size(100, NUM_CHANNELS, S_PS),
-        calc_fr_size(200, NUM_CHANNELS, S_PS),
-    ];
+    let frame_sizes = const {
+        [
+            calc_fr_size(MIN_FRAME_MICROS, NUM_CHANNELS, S_PS),
+            calc_fr_size(50, NUM_CHANNELS, S_PS),
+            calc_fr_size(100, NUM_CHANNELS, S_PS),
+            calc_fr_size(200, NUM_CHANNELS, S_PS),
+        ]
+    };
+
+    let mut last_sample = max * frame_size;
 
     while last_sample < tot_samples {
         let rem_samples = tot_samples - last_sample;
         let last_audio_s = last_sample - min(last_sample, skip_us);
 
-        match calc_biggest_spills(rem_samples, &frame_sizes) {
-            Some(frame_size) => {
-                let enc = if last_sample >= skip_us {
-                    inner_encoder.encode_no_skip(audio, last_audio_s, frame_size)?
-                } else {
-                    inner_encoder.encode_with_skip(
-                        audio,
-                        last_sample,
-                        last_sample + frame_size,
-                        skip_us,
-                    )?
-                };
-                last_sample += frame_size;
-                packet_writer.write_packet(
-                    enc,
-                    serial,
-                    is_end_of_stream(last_sample, tot_samples),
-                    granule::<S_PS>(last_sample / (NUM_CHANNELS as usize)),
-                )?;
-            }
-            None => {
-                // Maximum size for a 2.5 ms frame
-                const MAX_25_SIZE: usize =
-                    calc_fr_size(MIN_FRAME_MICROS, MAX_NUM_CHANNELS, OGG_OPUS_SPS);
-                let mut in_buffer = [0i16; MAX_25_SIZE];
-                let rem_skip = skip_us - min(last_sample, skip_us);
-                in_buffer[rem_skip..rem_samples].copy_from_slice(&audio[last_audio_s..]);
+        if let Some(&frame_size) = frame_sizes.iter().rev().find(|&&size| size <= rem_samples) {
+            let enc = if last_sample >= skip_us {
+                inner_encoder.encode_no_skip(audio, last_audio_s, frame_size)?
+            } else {
+                inner_encoder.encode_with_skip(
+                    audio,
+                    last_sample,
+                    last_sample + frame_size,
+                    skip_us,
+                )?
+            };
+            last_sample += frame_size;
+            packet_writer.write_packet(
+                enc,
+                serial,
+                is_end_of_stream(last_sample, tot_samples),
+                granule::<S_PS>(last_sample / NUM_CHANNELS as usize),
+            )?;
+        } else {
+            // Maximum size for a 2.5 ms frame
+            const MAX_25_SIZE: usize =
+                calc_fr_size(MIN_FRAME_MICROS, MAX_NUM_CHANNELS, OGG_OPUS_SPS);
+            let mut in_buffer = [0i16; MAX_25_SIZE];
+            let rem_skip = skip_us - min(last_sample, skip_us);
+            in_buffer[rem_skip..rem_samples].copy_from_slice(&audio[last_audio_s..]);
 
-                last_sample = tot_samples; // We end this here
+            last_sample = tot_samples; // We end this here
 
-                let enc = inner_encoder.encode_no_skip(&in_buffer, 0, frame_sizes[0])?;
-                packet_writer.write_packet(
-                    enc,
-                    serial,
-                    ogg::PacketWriteEndInfo::EndStream,
-                    granule::<S_PS>((skip_us + audio.len()) / (NUM_CHANNELS as usize)),
-                )?;
-            }
+            let enc = inner_encoder.encode_no_skip(&in_buffer, 0, frame_sizes[0])?;
+            packet_writer.write_packet(
+                enc,
+                serial,
+                ogg::PacketWriteEndInfo::EndStream,
+                granule::<S_PS>((skip_us + audio.len()) / NUM_CHANNELS as usize),
+            )?;
         }
     }
 
@@ -250,7 +225,7 @@ struct InnerEncoder {
 
 impl InnerEncoder {
     fn encode_vec(&self, audio: &[i16]) -> Result<Cow<'_, [u8]>, Error> {
-        let mut output: Vec<u8> = vec![0; MAX_PACKET];
+        let mut output = vec![0; MAX_PACKET];
         let result = self.encoder.encode(audio, &mut output)?;
         output.truncate(result);
         Ok(output.into())
